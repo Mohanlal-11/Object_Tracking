@@ -18,8 +18,7 @@ pip install -r requirements.txt
 ```bash
 python3 object_tracking.py --model <path to the .pth file> --vid_path <path to your video file>
 ```
-* Result from python script: \
-<video controls src="assets/tracked_output_python.mp4" title="python_result"></video>
+* Result from python script: [python result](assets/tracked_output_python.mp4)
 
 ## Object Tracking Using C++
 * I have implemented python version of multi-object tracker in c++.
@@ -45,8 +44,7 @@ cmake --build build --parallel
 ./build/object_tracking_cpp --model model.onnx --video video2.mp4
 ```
 
-* Result from C++ script: \
-<video controls src="assets/tracked_output_cpp.mp4" title="cpp_result"></video>
+* Result from C++ script: [cpp result](assets/tracked_output_cpp.mp4)
 
 * Here,  we can see the difference in `fps` between the implementation of multi-object traker using python and using cpp after converting pytorch model into onnx format.
 
