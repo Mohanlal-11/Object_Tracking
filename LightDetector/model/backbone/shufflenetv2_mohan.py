@@ -1,0 +1,249 @@
+import torch
+import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+
+from ..module.activation import act_layers
+
+model_urls = {
+    "shufflenetv2_0.5x": "https://download.pytorch.org/models/shufflenetv2_x0.5-f707e7126e.pth",  # noqa: E501
+    "shufflenetv2_1.0x": "https://download.pytorch.org/models/shufflenetv2_x1-5666bf0f80.pth",  # noqa: E501
+    "shufflenetv2_1.5x": "https://download.pytorch.org/models/shufflenetv2_x1_5-3c479a10.pth",  # noqa: E501
+    "shufflenetv2_2.0x": "https://download.pytorch.org/models/shufflenetv2_x2_0-8be3c8ee.pth",  # noqa: E501
+}
+
+
+class ChunkChannel(nn.Module):
+    def __init__(self, num_channels):
+        super(ChunkChannel, self).__init__()
+        self.num_channels = num_channels
+        
+        self.conv1 = nn.Conv2d(self.num_channels, self.num_channels//2, 1, bias=False)
+        self.conv2 = nn.Conv2d(self.num_channels, self.num_channels//2, 1, bias=False)
+        
+        self.initialize_wts()
+    
+    def initialize_wts(self):
+        split_channels = self.num_channels//2
+        with torch.no_grad():
+            wts1 = torch.zeros(self.num_channels//2, self.num_channels, 1, 1)
+            wts2 = torch.zeros(self.num_channels//2, self.num_channels, 1, 1)
+            for i in range(split_channels):
+                wts1[i, i, 0, 0] = 1
+                wts2[i, i+split_channels, 0, 0] = 1
+            self.conv1.weight = nn.Parameter(wts1.to(self.conv1.weight.device))
+            self.conv2.weight = nn.Parameter(wts2.to(self.conv2.weight.device))
+    
+    def forward(self, x):
+        x_part1 = self.conv1(x)
+        x_part2 = self.conv2(x)
+        return x_part1, x_part2   
+    
+class ChannelShuffleConv(nn.Module):
+    def __init__(self, channels):
+        super(ChannelShuffleConv, self).__init__()
+        self.channels = channels
+        
+        self.shuffle_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        with torch.no_grad():
+            w = torch.zeros(channels, channels, 1, 1)  # (out_channels, in_channels, kH, kW)
+
+            # Fill the weights to interleave the channels
+            for i in range(channels//2):
+                w[2 * i, i, 0, 0] = 1          # From first half
+                w[2 * i + 1, i + channels//2, 0, 0] = 1  # From second half
+
+            self.shuffle_conv.weight.copy_(w)
+
+    def forward(self, x):
+        return self.shuffle_conv(x)
+    
+    
+class ShuffleV2Block(nn.Module):
+    def __init__(self, inp, oup, stride, activation="ReLU"):
+        super(ShuffleV2Block, self).__init__()
+
+        if not (1 <= stride <= 3):
+            raise ValueError("illegal stride value")
+        self.stride = stride
+
+        branch_features = oup // 2
+        assert (self.stride != 1) or (inp == branch_features << 1)
+        
+        self.chunk_obj = ChunkChannel(num_channels=oup)
+        self.channel_shuffle = ChannelShuffleConv(channels=oup)
+        
+        if self.stride > 1:
+            self.branch1 = nn.Sequential(
+                self.depthwise_conv(
+                    inp, inp, kernel_size=3, stride=self.stride, padding=1
+                ),
+                nn.BatchNorm2d(inp),
+                nn.Conv2d(
+                    inp, branch_features, kernel_size=1, stride=1, padding=0, bias=False
+                ),
+                nn.BatchNorm2d(branch_features),
+                act_layers(activation),
+            )
+        else:
+            self.branch1 = nn.Sequential()
+
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(
+                inp if (self.stride > 1) else branch_features,
+                branch_features,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            nn.BatchNorm2d(branch_features),
+            act_layers(activation),
+            self.depthwise_conv(
+                branch_features,
+                branch_features,
+                kernel_size=3,
+                stride=self.stride,
+                padding=1,
+            ),
+            nn.BatchNorm2d(branch_features),
+            nn.Conv2d(
+                branch_features,
+                branch_features,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            nn.BatchNorm2d(branch_features),
+            act_layers(activation),
+        )
+
+    @staticmethod
+    def depthwise_conv(i, o, kernel_size, stride=1, padding=0, bias=False):
+        return nn.Conv2d(i, o, kernel_size, stride, padding, bias=bias, groups=i)
+
+    def forward(self, x):
+        if self.stride == 1:
+            # x1, x2 = x.chunk(2, dim=1)
+            x1, x2 = self.chunk(x)
+            out = torch.cat((x1, self.branch2(x2)), dim=1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+            
+        out = self.shuffle(out)
+        return out
+    
+    def chunk(self, x):
+        x1, x2 = self.chunk_obj(x)
+        return x1, x2
+
+    def shuffle(self, out):
+        y = self.channel_shuffle(out)
+        return y
+
+
+class ShuffleNetV2(nn.Module):
+    def __init__(
+        self,
+        model_size="1.5x",
+        out_stages=(2, 3, 4),
+        with_last_conv=False,
+        kernal_size=3,
+        activation="ReLU",
+        pretrain=False,
+    ):
+        super(ShuffleNetV2, self).__init__()
+        # out_stages can only be a subset of (2, 3, 4)
+        assert set(out_stages).issubset((2, 3, 4))
+
+        print("model size is ", model_size)
+
+        self.stage_repeats = [4, 8, 4]
+        self.model_size = model_size
+        self.out_stages = out_stages
+        self.with_last_conv = with_last_conv
+        self.kernal_size = kernal_size
+        self.activation = activation
+        if model_size == "0.5x":
+            self._stage_out_channels = [24, 48, 96, 192, 1024]
+        elif model_size == "1.0x":
+            self._stage_out_channels = [24, 116, 232, 464, 1024]
+        elif model_size == "1.5x":
+            self._stage_out_channels = [24, 176, 352, 704, 1024]
+        elif model_size == "2.0x":
+            self._stage_out_channels = [24, 244, 488, 976, 2048]
+        else:
+            raise NotImplementedError
+
+        # building first layer
+        input_channels = 3 # For RGB data
+        # input_channels = 1 # For Gray scale
+        output_channels = self._stage_out_channels[0]
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            act_layers(activation),
+        )
+        input_channels = output_channels
+
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        stage_names = ["stage{}".format(i) for i in [2, 3, 4]]
+        for name, repeats, output_channels in zip(
+            stage_names, self.stage_repeats, self._stage_out_channels[1:]
+        ):  
+            seq = [
+                ShuffleV2Block(
+                    input_channels, output_channels, 2, activation=activation
+                )
+            ]
+            for i in range(repeats - 1):
+                seq.append(
+                    ShuffleV2Block(
+                        output_channels, output_channels, 1, activation=activation
+                    )
+                )
+            setattr(self, name, nn.Sequential(*seq))
+            input_channels = output_channels
+        output_channels = self._stage_out_channels[-1]
+        if self.with_last_conv:
+            conv5 = nn.Sequential(
+                nn.Conv2d(input_channels, output_channels, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(output_channels),
+                act_layers(activation),
+            )
+            self.stage4.add_module("conv5", conv5)
+        self._initialize_weights(pretrain)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        output = []
+        for i in range(2, 5):
+            stage = getattr(self, "stage{}".format(i))
+            x = stage(x)
+            if i in self.out_stages:
+                output.append(x)
+        return tuple(output)
+
+    def _initialize_weights(self, pretrain=True):
+        print("init weights...")
+        for name, m in self.named_modules():
+            if isinstance(m, nn.Conv2d):
+                if "first" in name:
+                    nn.init.normal_(m.weight, 0, 0.01)
+                else:
+                    nn.init.normal_(m.weight, 0, 1.0 / m.weight.shape[1])
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0001)
+                nn.init.constant_(m.running_mean, 0)
+        if pretrain:
+            url = model_urls["shufflenetv2_{}".format(self.model_size)]
+            if url is not None:
+                pretrained_state_dict = model_zoo.load_url(url)
+                print("=> loading pretrained model {}".format(url))
+                self.load_state_dict(pretrained_state_dict, strict=False)

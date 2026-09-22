@@ -1,0 +1,256 @@
+# Copyright 2021 RangiLyu.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+import cv2
+import numpy as np
+import torch
+from pycocotools.coco import COCO
+import random
+
+from .base import BaseDataset
+
+class CocoDataset(BaseDataset):
+    def get_data_info(self, ann_path):
+        """
+        Load basic information of dataset such as image path, label and so on.
+        :param ann_path: coco json file path
+        :return: image info:
+        [{'license': 2,
+          'file_name': '000000000139.jpg',
+          'coco_url': 'http://images.cocodataset.org/val2017/000000000139.jpg',
+          'height': 426,
+          'width': 640,
+          'date_captured': '2013-11-21 01:34:01',
+          'flickr_url':
+              'http://farm9.staticflickr.com/8035/8024364858_9c41dc1666_z.jpg',
+          'id': 139},
+         ...
+        ]
+        """
+        self.coco_api = COCO(ann_path)
+        self.cat_ids = sorted(self.coco_api.getCatIds())
+        self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
+        self.cats = self.coco_api.loadCats(self.cat_ids)
+        self.class_names = [cat["name"] for cat in self.cats]
+        self.img_ids = sorted(self.coco_api.imgs.keys())
+        img_info = self.coco_api.loadImgs(self.img_ids)
+        return img_info
+
+    def get_per_img_info(self, idx):
+        img_info = self.data_info[idx]
+        file_name = img_info["file_name"]
+        height = img_info["height"]
+        width = img_info["width"]
+        id = img_info["id"]
+        if not isinstance(id, int):
+            raise TypeError("Image id must be int.")
+        info = {"file_name": file_name, "height": height, "width": width, "id": id}
+        return info
+
+    def get_img_annotation(self, idx):
+        """
+        load per image annotation
+        :param idx: index in dataloader
+        :return: annotation dict
+        """
+        img_id = self.img_ids[idx]
+        ann_ids = self.coco_api.getAnnIds([img_id])
+        anns = self.coco_api.loadAnns(ann_ids)
+
+        # anns = []
+        # img_info = self.get_per_img_info(idx)
+        # img_id = img_info['id']
+        # for annnos in self.coco_api.dataset['annotations']:
+        #     if img_id == annnos['id']:
+        #         anns.append(annnos)
+
+        gt_bboxes = []
+        gt_labels = []
+        gt_bboxes_ignore = []
+        if self.use_instance_mask:
+            gt_masks = []
+        if self.use_keypoint:
+            gt_keypoints = []
+
+        if anns != []:
+            for ann in anns:
+                x1, y1, w, h = ann["bbox"]
+                if ann["area"] <= 0 or w < 1 or h < 1:
+                    continue
+                if ann["category_id"] not in self.cat_ids:
+                    continue
+                bbox = [x1, y1, x1 + w, y1 + h]
+                if ann.get("iscrowd", False) or ann.get("ignore", False):
+                    gt_bboxes_ignore.append(bbox)
+                else:
+                    gt_bboxes.append(bbox)
+                    gt_labels.append(self.cat2label[ann["category_id"]])
+                    if self.use_instance_mask:
+                        gt_masks.append(self.coco_api.annToMask(ann))
+                    if self.use_keypoint:
+                        gt_keypoints.append(ann["keypoints"])
+        else:
+            pass
+        if gt_bboxes:
+            gt_bboxes = np.array(gt_bboxes, dtype=np.float32)
+            gt_labels = np.array(gt_labels, dtype=np.int64)
+        else:
+            gt_bboxes = np.zeros((0, 4), dtype=np.float32)
+            gt_labels = np.array([], dtype=np.int64)
+        if gt_bboxes_ignore:
+            gt_bboxes_ignore = np.array(gt_bboxes_ignore, dtype=np.float32)
+        else:
+            gt_bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+        annotation = dict(
+            bboxes=gt_bboxes, labels=gt_labels, bboxes_ignore=gt_bboxes_ignore
+        )
+        if self.use_instance_mask:
+            annotation["masks"] = gt_masks
+        if self.use_keypoint:
+            if gt_keypoints:
+                annotation["keypoints"] = np.array(gt_keypoints, dtype=np.float32)
+            else:
+                annotation["keypoints"] = np.zeros((0, 51), dtype=np.float32)
+        return annotation
+
+    def get_train_data(self, idx):
+        """
+        Load image and annotation
+        :param idx:
+        :return: meta-data (a dict containing image, annotation and other information)
+        """
+        img_info = self.get_per_img_info(idx)
+        file_name = img_info["file_name"]
+        image_path = os.path.join(self.img_path, file_name)
+        img = cv2.imread(image_path) # To read rgb image
+        # img = cv2.imread(image_path,  cv2.IMREAD_GRAYSCALE) # To read gray scale image
+        if img is None:
+            print("image {} read failed.".format(image_path))
+            raise FileNotFoundError("Cant load image! Please check image path!")
+        ann = self.get_img_annotation(idx)
+        meta = dict(
+            img=img,
+            img_info=img_info,
+            gt_bboxes=ann["bboxes"],
+            gt_labels=ann["labels"],
+            gt_bboxes_ignore=ann["bboxes_ignore"],
+        )
+        if self.use_instance_mask:
+            meta["gt_masks"] = ann["masks"]
+        if self.use_keypoint:
+            meta["gt_keypoints"] = ann["keypoints"]
+
+        input_size = self.input_size
+        if self.multi_scale:
+            input_size = self.get_random_size(self.multi_scale, input_size)
+            
+        if len(img.shape) == 2:  
+            meta["img"] = np.expand_dims(meta["img"], axis=-1)
+        if self.noise:
+            meta = self.pipeline(self, meta, input_size, annotation=ann) 
+        else:
+            meta = self.pipeline(self, meta, input_size) 
+
+        if self.mixup and random.random() < 0.5:  # 50% chance to apply mixup
+            # Save original image data
+            img1 = meta["img"]
+            box1 = meta["gt_bboxes"]
+            label1 = meta["gt_labels"]
+            
+            # Get random second image
+            idx2 = random.randint(0, len(self.img_ids)-1)
+            img_info2 = self.get_per_img_info(idx2)
+            file_name2 = img_info2["file_name"]
+            image_path2 = os.path.join(self.img_path, file_name2)
+            img2 = cv2.imread(image_path2)
+            # img2 = cv2.imread(image_path2, cv2.IMREAD_GRAYSCALE)
+            
+            if img2 is None:
+                return meta  # Return original if second image can't be loaded
+                
+            # Process second image
+            if len(img2.shape) == 2:
+                img2 = np.expand_dims(img2, axis=-1)
+            
+            # Get annotations for second image
+            ann2 = self.get_img_annotation(idx2)
+            box2 = ann2["bboxes"]
+
+            meta2 = dict(
+            img=img2,
+            img_info=img_info2,
+            gt_bboxes=ann2["bboxes"],
+            gt_labels=ann2["labels"],
+            gt_bboxes_ignore=ann2["bboxes_ignore"],
+            )
+            if self.use_instance_mask:
+                meta2["gt_masks"] = ann2["masks"]
+            if self.use_keypoint:
+                meta2["gt_keypoints"] = ann2["keypoints"]
+
+            if self.noise:
+                meta2 = self.pipeline(self, meta2, input_size, annotation=ann2) 
+            else:
+                meta2 = self.pipeline(self, meta2, input_size) 
+
+            img11 = meta2["img"]
+            box11 = meta2["gt_bboxes"]
+            label11 = meta2["gt_labels"]
+
+            # Generate random mixup ratio
+            alpha = 0.5  # You can adjust this or make it random between 0.1-0.9
+            lam = np.random.beta(alpha, alpha)
+            
+            if len(box1) != 0 and len(box11) != 0:
+                # Mixup images
+                # mixup_img = (lam * img1 + (1 - lam) * img11).astype(np.float32)
+                mixup_img = (alpha * img1 + alpha * img11).astype(np.float32)
+                
+                # Combine boxes and labels
+                if len(box1) > 0 and len(box11) > 0:
+                    mixup_boxes = np.vstack((box1, box11))
+                    mixup_labels = np.hstack((label1, label11))
+                elif len(box1) > 0:
+                    mixup_boxes = box1
+                    mixup_labels = label1
+                elif len(box11) > 0:
+                    mixup_boxes = box11
+                    mixup_labels = label11
+                else:
+                    mixup_boxes = np.zeros((0, 4), dtype=np.float32)
+                    mixup_labels = np.array([], dtype=np.int64)
+                
+                # Update meta dictionary
+                meta["img"] = mixup_img
+                meta["gt_bboxes"] = mixup_boxes
+                meta["gt_labels"] = mixup_labels
+    
+        # print(f'after aug: {meta["img"].shape}')
+        if len(img.shape) == 2:  
+            meta["img"] = np.expand_dims(meta["img"], axis=-1)
+        meta["img"] = torch.from_numpy(meta["img"].transpose(2, 0, 1))
+            
+        return meta
+
+    def get_val_data(self, idx):
+        """
+        Currently no difference from get_train_data.
+        Not support TTA(testing time augmentation) yet.
+        :param idx:
+        :return:
+        """
+        # TODO: support TTA
+        return self.get_train_data(idx)
